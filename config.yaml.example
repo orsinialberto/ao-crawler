@@ -1,0 +1,37 @@
+crawler:
+  seed_url: "https://docs.example.com/en/docs/welcome"
+  url_prefix: "https://docs.example.com/en/docs/"
+  max_depth: 10
+  max_pages: 500
+  delay_seconds: 0.5
+  respect_robots_txt: true
+  user_agent: "DocCrawler/1.0"
+  timeout_seconds: 15
+
+fetcher:
+  use_playwright: false
+  playwright_browser: chromium
+
+parser:
+  content_selectors:
+    - "main"
+    - "article"
+    - ".content"
+    - ".docs-content"
+    - "#main-content"
+  exclude_selectors:
+    - "nav"
+    - "header"
+    - "footer"
+    - ".sidebar"
+    - ".toc"
+    - ".breadcrumb"
+
+output:
+  directory: "./output"
+  filename_strategy: "path"
+  index_file: true
+
+logging:
+  level: "INFO"
+  file: null
