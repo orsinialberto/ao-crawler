@@ -3,7 +3,8 @@ crawler:
   url_prefix: "https://docs.example.com/en/docs/"
   max_depth: 10
   max_pages: 500
-  delay_seconds: 0.5
+  delay_seconds: 0.2
+  concurrency: 4
   respect_robots_txt: true
   user_agent: "DocCrawler/1.0"
   timeout_seconds: 15

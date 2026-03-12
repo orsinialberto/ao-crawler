@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import logging
 import signal
+import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
+
+import httpx
 
 from crawler.converter import convert
 from crawler.fetcher import fetch
@@ -70,7 +74,8 @@ class DocCrawler:
                 url_prefix = f"{p.scheme}://{p.netloc}/"
         max_depth = self.config.get("crawler", {}).get("max_depth", 0)
         max_pages = self.config.get("crawler", {}).get("max_pages", 0)
-        delay = self.config.get("crawler", {}).get("delay_seconds", 0.5)
+        delay = self.config.get("crawler", {}).get("delay_seconds", 0.2)
+        concurrency = max(1, int(self.config.get("crawler", {}).get("concurrency", 4)))
         respect_robots = self.config.get("crawler", {}).get("respect_robots_txt", True)
         user_agent = self.config.get("crawler", {}).get("user_agent", "DocCrawler/1.0")
         timeout = self.config.get("crawler", {}).get("timeout_seconds", 15)
@@ -93,81 +98,118 @@ class DocCrawler:
         except (ValueError, AttributeError):
             pass
 
-        total = 0
-        while self.queue and not self._interrupt_requested:
-            if max_pages and self.stats.pages_visited >= max_pages:
-                break
-            url, depth = self.queue.popleft()
-            if max_depth and depth > max_depth:
-                continue
-            if url in self.visited:
-                continue
-            if should_skip_resource(url):
-                continue
-            if respect_robots and self._robots_content is not None and not can_fetch(url, user_agent, self._robots_content):
-                logger.debug("Skipping (robots.txt): %s", url)
-                continue
+        playwright_lock = threading.Lock() if (use_playwright and concurrency > 1) else None
+        fetch_kwargs = {
+            "user_agent": user_agent,
+            "timeout_seconds": timeout,
+            "use_playwright": use_playwright,
+            "playwright_browser": playwright_browser,
+            "client": None,
+            "browser": None,
+            "playwright_lock": playwright_lock,
+        }
 
-            self.visited.add(url)
-            total += 1
-            logger.info("[%s/???] Fetching: %s", total, url)
+        def run_crawl_loop(
+            *,
+            client: httpx.Client | None = None,
+            browser: Any = None,
+        ) -> None:
+            fetch_kwargs["client"] = client
+            fetch_kwargs["browser"] = browser
+            total = 0
+            executor = ThreadPoolExecutor(max_workers=concurrency) if concurrency > 1 else None
+            try:
+                while self.queue and not self._interrupt_requested:
+                    if max_pages and self.stats.pages_visited >= max_pages:
+                        break
+                    batch: list[tuple[str, int]] = []
+                    while len(batch) < concurrency and self.queue and not self._interrupt_requested:
+                        if max_pages and self.stats.pages_visited + len(batch) >= max_pages:
+                            break
+                        url, depth = self.queue.popleft()
+                        if max_depth and depth > max_depth:
+                            continue
+                        if url in self.visited:
+                            continue
+                        if should_skip_resource(url):
+                            continue
+                        if respect_robots and self._robots_content is not None and not can_fetch(url, user_agent, self._robots_content):
+                            logger.debug("Skipping (robots.txt): %s", url)
+                            continue
+                        self.visited.add(url)
+                        batch.append((url, depth))
 
-            if self.dry_run:
-                self.stats.pages_visited += 1
-                # In dry run we still need to fetch to discover links (or we could fetch only for discovery)
-                result = fetch(url, user_agent=user_agent, timeout_seconds=timeout, use_playwright=use_playwright, playwright_browser=playwright_browser)
-                if result.error or result.status_code != 200:
-                    self.stats.pages_skipped += 1
-                    time.sleep(delay)
-                    continue
-                parsed = parse(result.html, url, url_prefix, content_selectors, exclude_selectors)
-                if not parsed.links:
-                    logger.warning(
-                        "No internal links found on %s (url_prefix=%s). "
-                        "If the site is JS-rendered, set fetcher.use_playwright: true in config.",
-                        url, url_prefix,
-                    )
-                for link in parsed.links:
-                    if link not in self.visited and not any(u == link for u, _ in self.queue):
-                        self.queue.append((link, depth + 1))
-                time.sleep(delay)
-                continue
+                    if not batch:
+                        break
 
-            if self.resume and path_exists_for_url(url, url_prefix, output_dir, filename_strategy):
-                logger.info("Skipping (already saved): %s", url)
-                self.stats.pages_visited += 1
-                self.stats.pages_skipped += 1
-                time.sleep(delay)
-                continue
+                    for (url, depth) in batch:
+                        total += 1
+                        logger.info("[%s/???] Fetching: %s", total, url)
 
-            result = fetch(url, user_agent=user_agent, timeout_seconds=timeout, use_playwright=use_playwright, playwright_browser=playwright_browser)
-            self.stats.pages_visited += 1
+                    if concurrency == 1:
+                        for (url, depth) in batch:
+                            if self._interrupt_requested:
+                                break
+                            self._process_one_url(
+                                url=url,
+                                depth=depth,
+                                fetch_kwargs=fetch_kwargs,
+                                delay=delay,
+                                dry_run=self.dry_run,
+                                resume=self.resume,
+                                url_prefix=url_prefix,
+                                output_dir=output_dir,
+                                filename_strategy=filename_strategy,
+                                content_selectors=content_selectors,
+                                exclude_selectors=exclude_selectors,
+                            )
+                    else:
+                        futures = {
+                            executor.submit(fetch, url, **fetch_kwargs): (url, depth)
+                            for (url, depth) in batch
+                        }
+                        for future in as_completed(futures):
+                            if self._interrupt_requested:
+                                break
+                            url, depth = futures[future]
+                            try:
+                                result = future.result()
+                            except Exception as e:
+                                logger.warning("Fetch task failed for %s: %s", url, e)
+                                self.stats.pages_visited += 1
+                                self.stats.pages_skipped += 1
+                                time.sleep(delay)
+                                continue
+                            self._process_one_result(
+                                url=url,
+                                depth=depth,
+                                result=result,
+                                delay=delay,
+                                url_prefix=url_prefix,
+                                output_dir=output_dir,
+                                filename_strategy=filename_strategy,
+                                content_selectors=content_selectors,
+                                exclude_selectors=exclude_selectors,
+                            )
+            finally:
+                if executor is not None:
+                    executor.shutdown(wait=True)
 
-            if result.error or result.status_code != 200:
-                self.stats.pages_skipped += 1
-                time.sleep(delay)
-                continue
-
-            canonical_url = result.url
-            self.visited.add(canonical_url)
-            parsed = parse(result.html, canonical_url, url_prefix, content_selectors, exclude_selectors)
-            if not parsed.links and len(self.visited) <= 1:
-                logger.warning(
-                    "No internal links found on %s (url_prefix=%s). "
-                    "If the site is JS-rendered, set fetcher.use_playwright: true in config.",
-                    canonical_url, url_prefix,
-                )
-            markdown = convert(parsed.content_html, parsed.title, canonical_url)
-            out_path = save_markdown(canonical_url, url_prefix, output_dir, markdown, filename_strategy, title=parsed.title)
-            self.stats.pages_saved += 1
-            rel_path = out_path.replace(output_dir.rstrip("/") + "/", "")
-            self.saved_entries.append((parsed.title, rel_path, canonical_url))
-
-            for link in parsed.links:
-                if link not in self.visited and not any(u == link for u, _ in self.queue):
-                    self.queue.append((link, depth + 1))
-
-            time.sleep(delay)
+        if use_playwright:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.launch() if playwright_browser == "chromium" else getattr(p, playwright_browser).launch()
+                try:
+                    run_crawl_loop(browser=browser)
+                finally:
+                    browser.close()
+        else:
+            with httpx.Client(
+                follow_redirects=True,
+                headers={"User-Agent": user_agent},
+                timeout=timeout,
+            ) as client:
+                run_crawl_loop(client=client)
 
         if self._interrupt_requested:
             self.stats.interrupted = True
@@ -182,6 +224,99 @@ class DocCrawler:
         logger.info("Pages skipped : %s", self.stats.pages_skipped)
         logger.info("Output dir    : %s", output_dir)
         return self.stats
+
+    def _process_one_url(
+        self,
+        *,
+        url: str,
+        depth: int,
+        fetch_kwargs: dict[str, Any],
+        delay: float,
+        dry_run: bool,
+        resume: bool,
+        url_prefix: str,
+        output_dir: str,
+        filename_strategy: str,
+        content_selectors: list[str],
+        exclude_selectors: list[str],
+    ) -> None:
+        """Fetch one URL and process the result (used when concurrency == 1)."""
+        if dry_run:
+            result = fetch(url, **fetch_kwargs)
+            self.stats.pages_visited += 1
+            if result.error or result.status_code != 200:
+                self.stats.pages_skipped += 1
+                time.sleep(delay)
+                return
+            self.visited.add(result.url)
+            parsed = parse(result.html, result.url, url_prefix, content_selectors, exclude_selectors)
+            if not parsed.links:
+                logger.warning(
+                    "No internal links found on %s (url_prefix=%s). "
+                    "If the site is JS-rendered, set fetcher.use_playwright: true in config.",
+                    url, url_prefix,
+                )
+            for link in parsed.links:
+                if link not in self.visited and not any(u == link for u, _ in self.queue):
+                    self.queue.append((link, depth + 1))
+            time.sleep(delay)
+            return
+        if resume and path_exists_for_url(url, url_prefix, output_dir, filename_strategy):
+            logger.info("Skipping (already saved): %s", url)
+            self.stats.pages_visited += 1
+            self.stats.pages_skipped += 1
+            time.sleep(delay)
+            return
+        result = fetch(url, **fetch_kwargs)
+        self._process_one_result(
+            url=url,
+            depth=depth,
+            result=result,
+            delay=delay,
+            url_prefix=url_prefix,
+            output_dir=output_dir,
+            filename_strategy=filename_strategy,
+            content_selectors=content_selectors,
+            exclude_selectors=exclude_selectors,
+        )
+
+    def _process_one_result(
+        self,
+        *,
+        url: str,
+        depth: int,
+        result: Any,
+        delay: float,
+        url_prefix: str,
+        output_dir: str,
+        filename_strategy: str,
+        content_selectors: list[str],
+        exclude_selectors: list[str],
+    ) -> None:
+        """Process a fetch result: parse, convert, save, enqueue links."""
+        self.stats.pages_visited += 1
+        if result.error or result.status_code != 200:
+            self.stats.pages_skipped += 1
+            time.sleep(delay)
+            return
+        canonical_url = result.url
+        self.visited.add(canonical_url)
+        parsed = parse(result.html, canonical_url, url_prefix, content_selectors, exclude_selectors)
+        if not parsed.links and len(self.visited) <= 1:
+            logger.warning(
+                "No internal links found on %s (url_prefix=%s). "
+                "If the site is JS-rendered, set fetcher.use_playwright: true in config.",
+                canonical_url, url_prefix,
+            )
+        markdown = convert(parsed.content_html, parsed.title, canonical_url)
+        out_path = save_markdown(canonical_url, url_prefix, output_dir, markdown, filename_strategy, title=parsed.title)
+        self.stats.pages_saved += 1
+        rel_path = out_path.replace(output_dir.rstrip("/") + "/", "")
+        self.saved_entries.append((parsed.title, rel_path, canonical_url))
+        for link in parsed.links:
+            if link not in self.visited and not any(u == link for u, _ in self.queue):
+                self.queue.append((link, depth + 1))
+        time.sleep(delay)
 
     def _handle_interrupt(self, signum: int, frame: Any) -> None:
         self._interrupt_requested = True
